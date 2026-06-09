@@ -262,8 +262,9 @@ app.post("/api/proxy", async (req, res) => {
 			});
 		}
 
-		// Build the proxy streaming URL
-		const proxyUrl = `${req.protocol}://${req.get("host")}/api/stream/${videoId}`;
+		// Build the proxy streaming URL (utiliser https si derriere un proxy)
+		const proto = req.headers["x-forwarded-proto"] || req.protocol;
+		const proxyUrl = `${proto}://${req.get("host")}/api/stream/${videoId}`;
 		console.log(`Proxy OK: "${title}" (${videoId})`);
 
 		return res.json({
