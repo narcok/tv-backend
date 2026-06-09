@@ -521,14 +521,25 @@ app.post("/api/twitch-clip", async (req, res) => {
 
 /**
  * GET /debug
- * Debug endpoint - shows cookie status
+ * Debug endpoint - shows cookie status and lists all cookie names
  */
 app.get("/debug", (req, res) => {
+	const cookieNames = [];
+	if (ytCookies) {
+		for (const pair of ytCookies.split("; ")) {
+			const eq = pair.indexOf("=");
+			if (eq > 0) cookieNames.push(pair.substring(0, eq));
+		}
+	}
 	res.json({
 		status: "ok",
 		hasCookies: !!ytCookies,
+		cookieCount: cookieNames.length,
+		cookieNames: cookieNames,
 		cookieLength: ytCookies ? ytCookies.length : 0,
-		cookiePreview: ytCookies ? ytCookies.substring(0, 100) : null,
+		hasSecure3PSID: cookieNames.includes("__Secure-3PSID"),
+		hasLOGIN_INFO: cookieNames.includes("LOGIN_INFO"),
+		hasPREF: cookieNames.includes("PREF"),
 		uptime: process.uptime(),
 		timestamp: new Date().toISOString(),
 	});
