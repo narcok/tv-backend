@@ -1,12 +1,31 @@
 /**
- * TV Backend - YouTube to MP4 URL Converter + Twitch Clip Extractor
+ * TV Backend - YouTube to MP4 Proxy for Roblox VideoFrame
  * Deploy on Render.com (Web Service)
  *
- * API:
- *   POST /api/convert     YouTube → MP4 direct URL
- *   POST /api/twitch-clip Twitch clip → MP4 direct URL (via signed CloudFront)
- *   GET  /api/info        YouTube video metadata
- *   GET  /health          Health check
+ * Endpoints:
+ *   POST /api/convert
+ *     Convertit YouTube en URL directe googlevideo.com (legacy)
+ *     Body: { "url": "https://www.youtube.com/watch?v=..." }
+ *     Response: { "success": true, "url": "https://...", "title": "..." }
+ *
+ *   POST /api/proxy
+ *     Valide une URL YouTube et retourne une URL proxy pour VideoFrame
+ *     Body: { "url": "https://www.youtube.com/watch?v=..." }
+ *     Response: { "success": true, "url": "https://BACKEND/api/stream/VIDEOID", "title": "...", "videoId": "..." }
+ *
+ *   GET /api/stream/:videoId
+ *     Stream une vidéo YouTube à travers le proxy (pour Roblox VideoFrame)
+ *     Response: Flux MP4 video/audio
+ *
+ *   GET /api/info
+ *     Metadata d'une vidéo (titre, duree, etc.)
+ *     Query: ?url=... ou ?id=...
+ *
+ *   POST /api/twitch-clip
+ *     Extrait l'URL directe d'un clip Twitch
+ *
+ *   GET /health
+ *     Response: { "status": "ok" }
  */
 
 const express = require("express");
@@ -16,111 +35,457 @@ const ytdl = require("@distube/ytdl-core");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Middleware
 app.use(cors());
 app.use(express.json());
 
+// Request logging
 app.use((req, res, next) => {
 	console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
 	next();
 });
 
 /**
- * POST /api/convert - YouTube → MP4
+ * POST /api/convert
+ * Convert a YouTube URL to a direct MP4 video URL
  */
 app.post("/api/convert", async (req, res) => {
 	const { url } = req.body;
-	if (!url) return res.status(400).json({ success: false, error: "Missing 'url'" });
-	if (!/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/.test(url))
-		return res.status(400).json({ success: false, error: "Invalid YouTube URL" });
+
+	if (!url) {
+		return res.status(400).json({
+			success: false,
+			error: "Missing 'url' in request body",
+		});
+	}
+
+	// Validate YouTube URL
+	const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/;
+	if (!youtubeRegex.test(url)) {
+		return res.status(400).json({
+			success: false,
+			error: "Invalid YouTube URL",
+		});
+	}
+
+	console.log(`Converting: ${url}`);
 
 	try {
+		console.log(`Fetching video info...`);
+		// Get video info from YouTube
 		const info = await ytdl.getInfo(url);
+		const title = info.videoDetails.title;
+		const videoId = info.videoDetails.videoId;
+
+		console.log(`Video: "${title}" (${videoId})`);
+
+		// Try to find a format with both audio and video (highest quality)
+		let selectedFormat = null;
+
+		// Priority: try to get a combined audio+video format
 		const formats = info.formats;
-		let selected = formats.filter(f => f.hasAudio && f.hasVideo && (f.container === "mp4" || f.container === "webm"));
-		if (selected.length === 0) selected = formats.filter(f => f.hasVideo && f.container === "mp4");
-		selected.sort((a, b) => (b.height || 0) - (a.height || 0));
-		const best = selected[0];
-		if (best?.url) return res.json({ success: true, url: best.url, title: info.videoDetails.title, videoId: info.videoDetails.videoId, quality: best.qualityLabel || "unknown" });
-		for (const f of formats) { if (f.url) return res.json({ success: true, url: f.url, title: info.videoDetails.title, videoId: info.videoDetails.videoId, quality: f.qualityLabel || "unknown" }); }
-		res.status(404).json({ success: false, error: "No playable format found" });
+		console.log(`Available formats: ${formats.length}`);
+
+		// Log all formats for debugging
+		for (const f of formats) {
+			if (f.hasVideo) {
+				console.log(`  Format: ${f.itag} ${f.qualityLabel || "?"} ${f.container} ${f.codecs || "?"} audio=${f.hasAudio} video=${f.hasVideo}`);
+			}
+		}
+
+		// First, look for a good quality combined format (both audio and video in any container)
+		const combinedFormats = formats.filter(
+			(f) => f.hasAudio && f.hasVideo && (f.container === "mp4" || f.container === "webm")
+		);
+
+		if (combinedFormats.length > 0) {
+			// Sort by quality (resolution height), highest first
+			combinedFormats.sort((a, b) => (b.height || 0) - (a.height || 0));
+			selectedFormat = combinedFormats[0];
+			console.log(
+				`Selected combined format: ${selectedFormat.qualityLabel || "?"} (${selectedFormat.container}) itag:${selectedFormat.itag}`
+			);
+		} else {
+			// Fallback: try mp4 video only (highest quality, no audio)
+			const videoFormats = formats.filter(
+				(f) => f.hasVideo && f.container === "mp4"
+			);
+			videoFormats.sort((a, b) => (b.height || 0) - (a.height || 0));
+
+			if (videoFormats.length > 0) {
+				selectedFormat = videoFormats[0];
+				console.log(
+					`Selected video-only format: ${selectedFormat.qualityLabel || "?"} (${selectedFormat.container}) itag:${selectedFormat.itag}`
+				);
+			}
+		}
+
+		if (selectedFormat && selectedFormat.url) {
+			console.log(`Returning URL (${selectedFormat.url.length} chars)`);
+			return res.json({
+				success: true,
+				url: selectedFormat.url,
+				title: title,
+				videoId: videoId,
+				quality: selectedFormat.qualityLabel || "unknown",
+			});
+		}
+
+		// Last resort: try to get any URL from any format
+		for (const f of formats) {
+			if (f.url) {
+				console.log(`Fallback format: ${f.qualityLabel || "unknown"}`);
+				return res.json({
+					success: true,
+					url: f.url,
+					title: title,
+					videoId: videoId,
+					quality: f.qualityLabel || "unknown",
+				});
+			}
+		}
+
+		res.status(404).json({
+			success: false,
+			error: "No playable format found for this video",
+		});
 	} catch (err) {
-		const msg = err.message || "";
-		if (msg.includes("429")) return res.status(429).json({ success: false, error: "YouTube rate limit" });
-		if (msg.includes("403")) return res.status(403).json({ success: false, error: "Video indisponible" });
+		const msg = err.message || "Unknown error";
+
+		// Detecter rate limiting YouTube
+		if (msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("status code: 429")) {
+			console.error(`YOUTUBE RATE LIMITED: ${msg}`);
+			return res.status(429).json({
+				success: false,
+				error: "YouTube rate limit. Attendez 30min ou ajoutez YT_COOKIES (voir README)",
+			});
+		}
+
+		// Detecter video bloquee
+		if (msg.includes("403") || msg.includes("Private video") || msg.includes("unavailable")) {
+			return res.status(403).json({
+				success: false,
+				error: "Video indisponible ou privee sur YouTube",
+			});
+		}
+
 		console.error(`Error: ${msg}`);
-		res.status(500).json({ success: false, error: `Conversion failed: ${msg}` });
+		res.status(500).json({
+			success: false,
+			error: `Conversion failed: ${msg}`,
+		});
 	}
 });
 
 /**
- * POST /api/twitch-clip - Twitch clip → signed MP4 URL
+ * POST /api/proxy
+ * Validate a YouTube URL and return a streaming proxy URL
+ * The client uses this URL directly in VideoFrame
+ */
+app.post("/api/proxy", async (req, res) => {
+	const { url } = req.body;
+
+	if (!url) {
+		return res.status(400).json({
+			success: false,
+			error: "Missing 'url' in request body",
+		});
+	}
+
+	// Validate YouTube URL
+	const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/;
+	if (!youtubeRegex.test(url)) {
+		return res.status(400).json({
+			success: false,
+			error: "Invalid YouTube URL",
+		});
+	}
+
+	console.log(`Proxy request: ${url}`);
+
+	try {
+		// Get video info and verify it's playable
+		const info = await ytdl.getInfo(url);
+		const videoId = info.videoDetails.videoId;
+		const title = info.videoDetails.title;
+
+		// Verify at least one progressive MP4 format exists
+		const hasPlayableFormat = info.formats.some(
+			(f) => f.hasAudio && f.hasVideo && f.container === "mp4"
+		);
+		if (!hasPlayableFormat) {
+			return res.status(404).json({
+				success: false,
+				error: "No playable MP4 format found for this video",
+			});
+		}
+
+		// Build the proxy streaming URL
+		const proxyUrl = `${req.protocol}://${req.get("host")}/api/stream/${videoId}`;
+		console.log(`Proxy OK: "${title}" (${videoId})`);
+
+		return res.json({
+			success: true,
+			url: proxyUrl,
+			title: title,
+			videoId: videoId,
+		});
+	} catch (err) {
+		const msg = err.message || "Unknown error";
+
+		if (msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("status code: 429")) {
+			console.error(`YOUTUBE RATE LIMITED: ${msg}`);
+			return res.status(429).json({
+				success: false,
+				error: "YouTube rate limit. Attendez 30min ou ajoutez YT_COOKIES",
+			});
+		}
+
+		if (msg.includes("403") || msg.includes("Private video") || msg.includes("unavailable")) {
+			return res.status(403).json({
+				success: false,
+				error: "Video indisponible ou privée sur YouTube",
+			});
+		}
+
+		console.error(`Proxy error: ${msg}`);
+		res.status(500).json({
+			success: false,
+			error: `Proxy failed: ${msg}`,
+		});
+	}
+});
+
+/**
+ * GET /api/stream/:videoId
+ * Stream a YouTube video through the proxy (for Roblox VideoFrame)
+ * VideoFrame loads this URL directly; backend fetches from YouTube in real-time
+ */
+app.get("/api/stream/:videoId", async (req, res) => {
+	const { videoId } = req.params;
+
+	// Validate video ID format
+	if (!videoId || !/^[a-zA-Z0-9_\-]{11}$/.test(videoId)) {
+		return res.status(400).json({
+			success: false,
+			error: "Invalid video ID format",
+		});
+	}
+
+	const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+	console.log(`Stream request: ${videoId}`);
+
+	try {
+		const info = await ytdl.getInfo(youtubeUrl);
+
+		// Find best progressive format (audio+video combined in mp4)
+		let format = info.formats.find((f) => f.itag == 18);  // 360p
+		if (!format) format = info.formats.find((f) => f.itag == 22);  // 720p
+		if (!format) format = info.formats.find((f) => f.itag == 36);  // 240p
+		if (!format) {
+			format = info.formats.find(
+				(f) => f.hasAudio && f.hasVideo && f.container === "mp4"
+			);
+		}
+		if (!format) {
+			console.error(`No suitable format for ${videoId}`);
+			return res.status(404).send("No suitable video format found");
+		}
+
+		console.log(`Streaming format: itag=${format.itag} ${format.qualityLabel || "?"} ${format.container}`);
+
+		// Set appropriate headers for video streaming
+		const mimeType = format.mimeType ? format.mimeType.split(";")[0] : "video/mp4";
+		res.setHeader("Content-Type", mimeType);
+		res.setHeader("Accept-Ranges", "bytes");
+		res.setHeader("Access-Control-Allow-Origin", "*");
+		res.setHeader("Cache-Control", "no-store");
+
+		// Create and pipe the video stream
+		const stream = ytdl.downloadFromInfo(info, { quality: format.itag });
+
+		stream.on("error", (err) => {
+			console.error(`Stream pipe error for ${videoId}: ${err.message}`);
+			if (!res.headersSent) {
+				res.status(500).end();
+			}
+		});
+
+		stream.pipe(res);
+	} catch (err) {
+		console.error(`Stream error for ${videoId}: ${err.message}`);
+		if (!res.headersSent) {
+			res.status(500).send(`Stream error: ${err.message}`);
+		}
+	}
+});
+
+/**
+ * GET /api/info
+ * Get video metadata only (no URL conversion)
+ */
+app.get("/api/info", async (req, res) => {
+	const { url, id } = req.query;
+	const videoUrl =
+		url || (id ? `https://www.youtube.com/watch?v=${id}` : null);
+
+	if (!videoUrl) {
+		return res.status(400).json({
+			success: false,
+			error: "Provide 'url' or 'id' query parameter",
+		});
+	}
+
+	try {
+		const info = await ytdl.getInfo(videoUrl);
+		res.json({
+			success: true,
+			title: info.videoDetails.title,
+			videoId: info.videoDetails.videoId,
+			lengthSeconds: parseInt(info.videoDetails.lengthSeconds),
+			author: info.videoDetails.author.name,
+			thumbnails: info.videoDetails.thumbnails,
+		});
+	} catch (err) {
+		res.status(500).json({
+			success: false,
+			error: err.message,
+		});
+	}
+});
+
+/**
+ * POST /api/twitch-clip
+ * Extract direct MP4 URL from a Twitch clip
  */
 app.post("/api/twitch-clip", async (req, res) => {
 	const { url } = req.body;
-	if (!url) return res.status(400).json({ success: false, error: "Missing 'url'" });
 
+	if (!url) {
+		return res.status(400).json({
+			success: false,
+			error: "Missing 'url' in request body",
+		});
+	}
+
+	// Extract clip slug from various Twitch URL formats
 	let slug = null;
-	let m = url.match(/twitch\.tv\/[^\/]+\/clip\/([a-zA-Z0-9_\-]+)/);
-	if (m) slug = m[1];
-	if (!slug) { m = url.match(/clips\.twitch\.tv\/([a-zA-Z0-9_\-]+)/); if (m) slug = m[1]; }
-	if (!slug) return res.status(400).json({ success: false, error: "Invalid Twitch clip URL" });
+
+	// Format: https://www.twitch.tv/{channel}/clip/{slug}
+	let match = url.match(/twitch\.tv\/[^\/]+\/clip\/([a-zA-Z0-9_\-]+)/);
+	if (match) slug = match[1];
+
+	// Format: https://clips.twitch.tv/{slug}
+	if (!slug) {
+		match = url.match(/clips\.twitch\.tv\/([a-zA-Z0-9_\-]+)/);
+		if (match) slug = match[1];
+	}
+
+	if (!slug) {
+		return res.status(400).json({
+			success: false,
+			error: "Invalid Twitch clip URL. Expected: twitch.tv/{channel}/clip/{slug} or clips.twitch.tv/{slug}",
+		});
+	}
 
 	console.log(`Twitch clip slug: ${slug}`);
+
 	try {
-		const resp = await fetch("https://gql.twitch.tv/gql", {
+		// Use Twitch's persisted GQL query to get clip metadata + playbackAccessToken
+		const response = await fetch("https://gql.twitch.tv/gql", {
 			method: "POST",
-			headers: { "Content-Type": "application/json", "Client-Id": "kimne78kx3ncx6brgo4mv6wki5h1ko" },
+			headers: {
+				"Content-Type": "application/json",
+				"Client-Id": "kimne78kx3ncx6brgo4mv6wki5h1ko",
+			},
 			body: JSON.stringify({
 				operationName: "ShareClipRenderStatus",
 				variables: { slug },
-				extensions: { persistedQuery: { version: 1, sha256Hash: "324783ea014524fa10a88739aa507de7a52f9624574dba9739a52b8c97d885cf" } },
+				extensions: {
+					persistedQuery: {
+						version: 1,
+						sha256Hash: "324783ea014524fa10a88739aa507de7a52f9624574dba9739a52b8c97d885cf",
+					},
+				},
 			}),
 		});
-		if (!resp.ok) return res.status(502).json({ success: false, error: `Twitch API error ${resp.status}` });
-		const data = await resp.json();
-		if (!data?.data?.clip) return res.status(404).json({ success: false, error: "Clip not found" });
+
+		if (!response.ok) {
+			console.error(`Twitch API error: ${response.status}`);
+			return res.status(502).json({
+				success: false,
+				error: `Twitch API returned status ${response.status}`,
+			});
+		}
+
+		const data = await response.json();
+
+		if (!data?.data?.clip) {
+			return res.status(404).json({
+				success: false,
+				error: "Clip not found on Twitch",
+			});
+		}
 
 		const clip = data.data.clip;
 		const qualities = clip.videoQualities;
 		const token = clip.playbackAccessToken;
-		if (!qualities?.length) return res.status(404).json({ success: false, error: "No video qualities found" });
-		if (!token?.signature || !token?.value) return res.status(403).json({ success: false, error: "Clip requires authentication" });
 
+		if (!qualities || qualities.length === 0) {
+			return res.status(404).json({
+				success: false,
+				error: "No video qualities found for this clip",
+			});
+		}
+
+		if (!token?.signature || !token?.value) {
+			return res.status(403).json({
+				success: false,
+				error: "Clip requires authentication (no playback token)",
+			});
+		}
+
+		// Sort by quality (highest first)
 		qualities.sort((a, b) => parseInt(b.quality) - parseInt(a.quality));
+
 		const best = qualities[0];
+
+		// Build signed URL with playback token
 		const signedUrl = best.sourceURL + "?sig=" + token.signature + "&token=" + encodeURIComponent(token.value);
 
 		console.log(`Twitch clip: "${clip.title}" - ${best.quality}p`);
-		return res.json({ success: true, url: signedUrl, title: clip.title, slug: clip.slug, quality: `${best.quality}p` });
+
+		return res.json({
+			success: true,
+			url: signedUrl,
+			title: clip.title,
+			slug: clip.slug,
+			quality: `${best.quality}p`,
+		});
 	} catch (err) {
 		console.error(`Twitch clip error: ${err.message}`);
-		res.status(500).json({ success: false, error: `Twitch clip failed: ${err.message}` });
+		return res.status(500).json({
+			success: false,
+			error: `Twitch clip failed: ${err.message}`,
+		});
 	}
 });
 
 /**
- * GET /api/info - YouTube metadata
- */
-app.get("/api/info", async (req, res) => {
-	const { url, id } = req.query;
-	const videoUrl = url || (id ? `https://www.youtube.com/watch?v=${id}` : null);
-	if (!videoUrl) return res.status(400).json({ success: false, error: "Provide 'url' or 'id'" });
-	try {
-		const info = await ytdl.getInfo(videoUrl);
-		res.json({ success: true, title: info.videoDetails.title, videoId: info.videoDetails.videoId, lengthSeconds: parseInt(info.videoDetails.lengthSeconds), author: info.videoDetails.author.name, thumbnails: info.videoDetails.thumbnails });
-	} catch (err) { res.status(500).json({ success: false, error: err.message }); }
-});
-
-/**
  * GET /health
+ * Health check endpoint
  */
 app.get("/health", (req, res) => {
-	res.json({ status: "ok", uptime: process.uptime(), timestamp: new Date().toISOString() });
+	res.json({
+		status: "ok",
+		uptime: process.uptime(),
+		timestamp: new Date().toISOString(),
+	});
 });
 
+// Start server
 app.listen(PORT, "0.0.0.0", () => {
 	console.log(`TV Backend running on port ${PORT}`);
-	console.log(`Health: GET /health`);
-	console.log(`YouTube: POST /api/convert`);
-	console.log(`Twitch:  POST /api/twitch-clip`);
+	console.log(`Health check: http://localhost:${PORT}/health`);
+	console.log(`Convert API: POST http://localhost:${PORT}/api/convert`);
 });
