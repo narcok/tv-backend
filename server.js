@@ -35,6 +35,60 @@ const ytdl = require("@distube/ytdl-core");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// === COOKIES YOUTUBE ===
+// Optionnel: définir YT_COOKIES dans les variables d'environnement Render
+// pour éviter le rate-limiting YouTube.
+// Formats acceptés:
+//   - Chaîne HTTP: "name=value; name2=value2"
+//   - Netscape cookies.txt: lignes avec tabulations (export extension navigateur)
+let ytCookies = null;
+if (process.env.YT_COOKIES) {
+	let raw = process.env.YT_COOKIES.trim();
+
+	// Détecter le format Netscape (contient des tabulations et des domaines)
+	if (raw.includes("\t") || raw.includes("# ")) {
+		// Format cookies.txt: extraire les name=value des lignes valides
+		const pairs = [];
+		for (const line of raw.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("//")) continue;
+			const parts = trimmed.split("\t");
+			// Netscape format: domain flag path secure expiry name value
+			if (parts.length >= 7) {
+				const name = parts[parts.length - 2];
+				const value = parts[parts.length - 1];
+				if (name && value) pairs.push(`${name}=${value}`);
+			}
+		}
+		if (pairs.length > 0) {
+			ytCookies = pairs.join("; ");
+			console.log(`Parsed ${pairs.length} cookies from Netscape format`);
+		}
+	} else {
+		// Format déjà en chaîne HTTP
+		ytCookies = raw;
+	}
+
+	if (ytCookies) {
+		console.log(`YT_COOKIES ready (${ytCookies.length} chars)`);
+	} else {
+		console.warn("YT_COOKIES set but could not parse any cookies");
+	}
+}
+
+// Crée les options pour les appels ytdl avec cookies si présents
+function makeYtdlOptions(extra = {}) {
+	const opts = { ...extra };
+	if (ytCookies) {
+		opts.requestOptions = opts.requestOptions || {};
+		opts.requestOptions.headers = {
+			...(opts.requestOptions.headers || {}),
+			Cookie: ytCookies,
+		};
+	}
+	return opts;
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -73,7 +127,7 @@ app.post("/api/convert", async (req, res) => {
 	try {
 		console.log(`Fetching video info...`);
 		// Get video info from YouTube
-		const info = await ytdl.getInfo(url);
+		const info = await ytdl.getInfo(url, makeYtdlOptions());
 		const title = info.videoDetails.title;
 		const videoId = info.videoDetails.videoId;
 
@@ -86,37 +140,25 @@ app.post("/api/convert", async (req, res) => {
 		const formats = info.formats;
 		console.log(`Available formats: ${formats.length}`);
 
-		// Log all formats for debugging
-		for (const f of formats) {
-			if (f.hasVideo) {
-				console.log(`  Format: ${f.itag} ${f.qualityLabel || "?"} ${f.container} ${f.codecs || "?"} audio=${f.hasAudio} video=${f.hasVideo}`);
-			}
-		}
-
-		// First, look for a good quality combined format (both audio and video in any container)
+		// First, look for a good quality combined format (both audio and video in mp4)
 		const combinedFormats = formats.filter(
-			(f) => f.hasAudio && f.hasVideo && (f.container === "mp4" || f.container === "webm")
+			(f) => f.hasAudio && f.hasVideo && f.container === "mp4"
 		);
 
 		if (combinedFormats.length > 0) {
 			// Sort by quality (resolution height), highest first
 			combinedFormats.sort((a, b) => (b.height || 0) - (a.height || 0));
 			selectedFormat = combinedFormats[0];
-			console.log(
-				`Selected combined format: ${selectedFormat.qualityLabel || "?"} (${selectedFormat.container}) itag:${selectedFormat.itag}`
-			);
+			console.log(`Selected: ${selectedFormat.qualityLabel || "?"} mp4 itag:${selectedFormat.itag}`);
 		} else {
-			// Fallback: try mp4 video only (highest quality, no audio)
+			// Fallback: mp4 video only (highest quality)
 			const videoFormats = formats.filter(
 				(f) => f.hasVideo && f.container === "mp4"
 			);
 			videoFormats.sort((a, b) => (b.height || 0) - (a.height || 0));
-
 			if (videoFormats.length > 0) {
 				selectedFormat = videoFormats[0];
-				console.log(
-					`Selected video-only format: ${selectedFormat.qualityLabel || "?"} (${selectedFormat.container}) itag:${selectedFormat.itag}`
-				);
+				console.log(`Selected video-only: ${selectedFormat.qualityLabel || "?"} mp4 itag:${selectedFormat.itag}`);
 			}
 		}
 
@@ -131,7 +173,7 @@ app.post("/api/convert", async (req, res) => {
 			});
 		}
 
-		// Last resort: try to get any URL from any format
+		// Last resort: any format with a URL
 		for (const f of formats) {
 			if (f.url) {
 				console.log(`Fallback format: ${f.qualityLabel || "unknown"}`);
@@ -204,8 +246,8 @@ app.post("/api/proxy", async (req, res) => {
 	console.log(`Proxy request: ${url}`);
 
 	try {
-		// Get video info and verify it's playable
-		const info = await ytdl.getInfo(url);
+		// Get video info and verify it's playable (avec cookies si presents)
+		const info = await ytdl.getInfo(url, makeYtdlOptions());
 		const videoId = info.videoDetails.videoId;
 		const title = info.videoDetails.title;
 
@@ -276,7 +318,8 @@ app.get("/api/stream/:videoId", async (req, res) => {
 	console.log(`Stream request: ${videoId}`);
 
 	try {
-		const info = await ytdl.getInfo(youtubeUrl);
+		const opts = makeYtdlOptions();
+		const info = await ytdl.getInfo(youtubeUrl, opts);
 
 		// Find best progressive format (audio+video combined in mp4)
 		let format = info.formats.find((f) => f.itag == 18);  // 360p
@@ -301,8 +344,13 @@ app.get("/api/stream/:videoId", async (req, res) => {
 		res.setHeader("Access-Control-Allow-Origin", "*");
 		res.setHeader("Cache-Control", "no-store");
 
-		// Create and pipe the video stream
-		const stream = ytdl.downloadFromInfo(info, { quality: format.itag });
+		// Create and pipe the video stream (avec cookies pour le download)
+		const streamOpts = { quality: format.itag };
+		if (ytCookies) {
+			streamOpts.requestOptions = streamOpts.requestOptions || {};
+			streamOpts.requestOptions.headers = { Cookie: ytCookies };
+		}
+		const stream = ytdl.downloadFromInfo(info, streamOpts);
 
 		stream.on("error", (err) => {
 			console.error(`Stream pipe error for ${videoId}: ${err.message}`);
@@ -337,7 +385,7 @@ app.get("/api/info", async (req, res) => {
 	}
 
 	try {
-		const info = await ytdl.getInfo(videoUrl);
+		const info = await ytdl.getInfo(videoUrl, makeYtdlOptions());
 		res.json({
 			success: true,
 			title: info.videoDetails.title,
