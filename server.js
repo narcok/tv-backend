@@ -520,6 +520,21 @@ app.post("/api/twitch-clip", async (req, res) => {
 });
 
 /**
+ * GET /debug
+ * Debug endpoint - shows cookie status
+ */
+app.get("/debug", (req, res) => {
+	res.json({
+		status: "ok",
+		hasCookies: !!ytCookies,
+		cookieLength: ytCookies ? ytCookies.length : 0,
+		cookiePreview: ytCookies ? ytCookies.substring(0, 100) : null,
+		uptime: process.uptime(),
+		timestamp: new Date().toISOString(),
+	});
+});
+
+/**
  * GET /health
  * Health check endpoint
  */
